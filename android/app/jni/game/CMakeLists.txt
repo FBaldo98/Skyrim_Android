@@ -1,6 +1,6 @@
 # The game: host runtime + recompiled code from port/runtime and port/gen.
 get_filename_component(PORT ${CMAKE_CURRENT_SOURCE_DIR}/../../../.. ABSOLUTE)
-file(GLOB GEN_SRC ${PORT}/gen/*.c)
+file(GLOB GEN_SRC CONFIGURE_DEPENDS ${PORT}/gen/*.c)
 file(GLOB RT_SRC ${PORT}/runtime/*.c)
 file(GLOB RT_CXX ${PORT}/runtime/*.cpp)
 
@@ -19,10 +19,18 @@ target_compile_options(lbgen PRIVATE -std=gnu11 -O2 -mtune=cortex-a73 -g0 -fno-s
 file(GLOB D3DC_SRC ${PORT}/gen/x3da_*.c)
 set_source_files_properties(${D3DC_SRC} PROPERTIES COMPILE_OPTIONS "-O2")
 
+# FFmpeg WMA decoder (LGPL 2.1+), built for arm64-v8a with only wmav1/wmav2
+# enabled. Used by runtime/xaudio2.c for Skyrim's xWMA voices and music.
+set(FFMPEG ${PORT}/android/app/jni/ffmpeg)
+add_library(ff_avcodec STATIC IMPORTED)
+set_target_properties(ff_avcodec PROPERTIES IMPORTED_LOCATION ${FFMPEG}/lib/arm64-v8a/libavcodec.a)
+add_library(ff_avutil STATIC IMPORTED)
+set_target_properties(ff_avutil PROPERTIES IMPORTED_LOCATION ${FFMPEG}/lib/arm64-v8a/libavutil.a)
+
 add_library(main SHARED ${RT_SRC} ${RT_CXX} $<TARGET_OBJECTS:lbgen>)
-target_include_directories(main PRIVATE ${PORT}/runtime ${PORT}/gen ../sdlinc
+target_include_directories(main PRIVATE ${PORT}/runtime ${PORT}/gen ../sdlinc ${FFMPEG}/include
     ../dxvk/include/native/directx ../dxvk/include/native/windows ../dxvk/include/native)
 target_compile_definitions(main PRIVATE DXVK_NATIVE GAME_SKYRIM)
 target_compile_options(main PRIVATE -O2 -fno-strict-aliasing -fwrapv -fsigned-char -Wno-everything
     $<$<COMPILE_LANGUAGE:C>:-std=gnu11>)
-target_link_libraries(main PRIVATE SDL2 dxvk_d3d9 m $<$<BOOL:${ANDROID}>:log> $<$<BOOL:${ANDROID}>:android>)
+target_link_libraries(main PRIVATE SDL2 dxvk_d3d9 ff_avcodec ff_avutil m $<$<BOOL:${ANDROID}>:log> $<$<BOOL:${ANDROID}>:android>)

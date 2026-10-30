@@ -157,4 +157,4 @@ Switches: create an empty file with one of these names in `port/save/`:
 - Performance on an Adreno 610 is low; use the Low preset and a low resolution.
 
 ## Legal
-The Elder Scrolls, Skyrim, Bethesda and all related names and assets belong to their respective owners. This project is not affiliated with or endorsed by them. Do not redistribute anything produced from the game or game files. Third-party code keeps its own licenses: SDL2 (zlib) in `android/app/jni/SDL2`, dxvk-native (zlib) in `android/app/jni/dxvk`.
+The Elder Scrolls, Skyrim, Bethesda and all related names and assets belong to their respective owners. This project is not affiliated with or endorsed by them. Do not redistribute anything produced from the game or game files. Third-party code keeps its own licenses: SDL2 (zlib) in `android/app/jni/SDL2`, dxvk-native (zlib) in `android/app/jni/dxvk`, FFmpeg (LGPL 2.1 or later) in `android/app/jni/ffmpeg` (wmav1/wmav2 decoders only).
