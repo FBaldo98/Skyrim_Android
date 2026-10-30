@@ -8,7 +8,7 @@ def dual = project.hasProperty('dual') && project.property('dual') == 'true'
 android {
     namespace "com.tj.skyrim"
     compileSdkVersion 34
-    ndkVersion project.hasProperty('ndkVersion') ? project.property('ndkVersion') : null
+    ndkVersion project.hasProperty('ndkVersion') ? project.property('ndkVersion') : "28.2.13676358"
     defaultConfig {
         applicationId dual ? "com.tj.skyrim.dual" : "com.tj.skyrim"
         resValue "string", "app_name", dual ? "Skyrim Dual" : "Skyrim"
@@ -19,7 +19,7 @@ android {
         versionName dual ? "0.21-dual" : "0.21"
         externalNativeBuild {
             cmake {
-                arguments "-DANDROID_STL=c++_shared", "-DANDROID_PLATFORM=android-28"
+                arguments "-DANDROID_STL=c++_shared", "-DANDROID_PLATFORM=android-28", "-DLB_GEN_JOBS=6"
                 abiFilters 'arm64-v8a'
             }
         }

@@ -89,8 +89,7 @@ public class LauncherActivity extends Activity {
     }
 
     private int defaultMode(int[][] m) {
-        for (int i = 0; i < m.length; i++) if (m[i][1] <= 540) return i;
-        return m.length - 1;
+        return 0;  // native resolution
     }
     private static final String[] AA = {"Off", "2x", "4x", "8x"};
     private static final int[] AA_V = {1, 2, 4, 8};
@@ -190,7 +189,7 @@ public class LauncherActivity extends Activity {
         root.addView(pick);
 
         text(root, "Options", 20, true);
-        Spinner preset = spinner(root, "preset", "Detail", PRESETS, 0);
+        Spinner preset = spinner(root, "preset", "Detail", PRESETS, 2);
         Spinner aspect = spinner(root, "aspect", "Aspect ratio", ASPECTS, 0);
         int[][] m = modes(aspect.getSelectedItemPosition());
         Spinner res = spinner(root, "res", "Resolution", modeNames(m), defaultMode(m));
@@ -213,13 +212,13 @@ public class LauncherActivity extends Activity {
             @Override public void onNothingSelected(AdapterView<?> p) {}
         });
         prefs.edit().putInt("aspectShown", aspect.getSelectedItemPosition()).apply();
-        spinner(root, "aa", "Antialiasing", AA, 0);
-        spinner(root, "aniso", "Anisotropic filtering", ANISO, 0);
-        spinner(root, "texq", "Texture quality", TEXQ, 1);
-        spinner(root, "shadow", "Shadow detail", SHADOW, 0);
-        spinner(root, "decals", "Decal quantity", DECALS, 0);
-        spinner(root, "blur", "Radial blur quality", BLUR, 0);
-        spinner(root, "fade", "Object fade distance", FADE, 0);
+        spinner(root, "aa", "Antialiasing", AA, 2);
+        spinner(root, "aniso", "Anisotropic filtering", ANISO, 3);
+        spinner(root, "texq", "Texture quality", TEXQ, 2);
+        spinner(root, "shadow", "Shadow detail", SHADOW, 2);
+        spinner(root, "decals", "Decal quantity", DECALS, 2);
+        spinner(root, "blur", "Radial blur quality", BLUR, 2);
+        spinner(root, "fade", "Object fade distance", FADE, 2);
         check(root, "fxaa", "FXAA", false);
         check(root, "vsync", "Vertical sync", true);
         check(root, "touch", "Touch controls", true);
@@ -347,13 +346,16 @@ public class LauncherActivity extends Activity {
 
     // SHA-1 of the Steam TESV.exe (1.9.32.0.8) the port was recompiled from:
     // other versions have different code at different addresses and would crash.
-    private static final String SHA_TESV_STEAM = "f39aecebf6e332616c4c518617073f6e8250e0f8";
+    // The second hash is the same 1.9.32.0 executable after a repack (SteamStub
+    // already removed, sections realigned); the code and RVAs are unchanged.
+    private static final String[] SHA_TESV_STEAM = {"f39aecebf6e332616c4c518617073f6e8250e0f8",
+                                                    "57fbbcab194b6b30aa74958b68e6aa1e12f51547"};
 
-    private void checkSha(File f, String want, String name, List<String> bad) {
+    private void checkSha(File f, String[] want, String name, List<String> bad) {
         String got = sha1(f);
         if (got == null) bad.add("cannot read " + name);
-        else if (!got.equals(want)) bad.add(name + " is the wrong version (SHA-1 " + got.substring(0, 8)
-                + ", expected " + want.substring(0, 8) + ")");
+        else if (!java.util.Arrays.asList(want).contains(got)) bad.add(name + " is the wrong version (SHA-1 "
+                + got.substring(0, 8) + ", expected " + want[0].substring(0, 8) + ")");
     }
 
     /* SHA-1 as hex, cached by path, size and modification time; null if unreadable. */
