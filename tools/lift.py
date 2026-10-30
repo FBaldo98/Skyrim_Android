@@ -92,6 +92,32 @@ X87REG = os.environ.get("LIFT_X87REG", "1") == "1"
 X87_BARRIER = ("fxam(", "fprem(", "fpu_env(", "fstatus(", "c->top", "c->st")
 
 
+# Imports called millions of times a second whose shims are a few loads and
+# stores: emitted in place of the call, skipping the spill, dispatch and
+# watchdog bookkeeping. Each matches its shim in runtime/kernel32.c (stdcall:
+# pops its arguments; no return address is pushed). LIFT_INLINE_IMPORTS=0
+# calls the shims.
+INLINE_IMPORTS = {} if os.environ.get("LIFT_INLINE_IMPORTS", "1") != "1" else {
+    "KERNEL32.dll!TlsGetValue":
+        "{ uint32_t i_ = M32(esp); eax = i_ < 576u ? M32(c->fs_base + (i_ < 64u ? 0xE10u + 4u * i_ : "
+        "0x1800u + 4u * (i_ - 64u))) : 0u; M32(c->fs_base + 0x34u) = 0u; esp += 4; }",
+    "KERNEL32.dll!GetCurrentThreadId": "eax = M32(c->fs_base + 0x24u);",
+    "KERNEL32.dll!GetLastError": "eax = M32(c->fs_base + 0x34u);",
+    "KERNEL32.dll!SetLastError": "{ M32(c->fs_base + 0x34u) = M32(esp); eax = 0u; esp += 4; }",
+    "KERNEL32.dll!InterlockedIncrement":
+        "{ __atomic_thread_fence(__ATOMIC_SEQ_CST); eax = __atomic_add_fetch((uint32_t *)(MEM + M32(esp)), 1u, "
+        "__ATOMIC_SEQ_CST); __atomic_thread_fence(__ATOMIC_SEQ_CST); esp += 4; }",
+    "KERNEL32.dll!InterlockedDecrement":
+        "{ __atomic_thread_fence(__ATOMIC_SEQ_CST); eax = __atomic_sub_fetch((uint32_t *)(MEM + M32(esp)), 1u, "
+        "__ATOMIC_SEQ_CST); __atomic_thread_fence(__ATOMIC_SEQ_CST); esp += 4; }",
+    "KERNEL32.dll!InterlockedCompareExchange":
+        "{ uint32_t d_ = M32(esp), x_ = M32(esp + 4), e_ = M32(esp + 8); __atomic_thread_fence(__ATOMIC_SEQ_CST); "
+        "int ok_ = __atomic_compare_exchange_n((uint32_t *)(MEM + d_), &e_, x_, 0, __ATOMIC_SEQ_CST, "
+        "__ATOMIC_SEQ_CST); __atomic_thread_fence(__ATOMIC_SEQ_CST); if (ok_ && !x_ && e_) rt_spin_release(d_); "
+        "eax = e_; esp += 12; }",
+}
+
+
 def is_x87(i):
     """Escape opcodes D8-DF after any prefixes (decoded by Lifter.lift_x87)."""
     b = i.bytes
@@ -256,7 +282,11 @@ HOST_OVERRIDES_MARVEL = {
             0x6E7AA0},  # runtime shader compile (D3DCompile): serialised -> runtime/marvel_shims.c
     "d3dc": {0x9066C20, 0x9067AD0},  # D3DCompile/D3DPreprocess: progress, timing, warm-up gate -> runtime/marvel_shims.c
 }
-HOST_OVERRIDES_SKYRIM = {}
+HOST_OVERRIDES_SKYRIM = {
+    "exe": {0xF52240,   # CRT memset  -> runtime/skyrim_crt.c
+            0xF537F0,   # CRT memcpy
+            0xF52E30},  # CRT memmove
+}
 # LIFT_GAME=marvel|skyrim selects the overrides (runtime built with -DGAME_MARVEL / -DGAME_SKYRIM).
 HOST_OVERRIDES = {"marvel": HOST_OVERRIDES_MARVEL, "skyrim": HOST_OVERRIDES_SKYRIM}.get(
     os.environ.get("LIFT_GAME"), HOST_OVERRIDES_BATMAN)
@@ -1289,6 +1319,36 @@ class Lifter:
             o.insert(decl_at, "    double %s;" % ", ".join(sorted(x87.names)))
         return o
 
+    def reg_imports(self):
+        """Callee-saved registers that hold an import for the whole function:
+        written by exactly one instruction, `mov reg, [iat slot]`, besides the
+        epilogue's pop (MSVC loads a hot import into ebp/esi/edi/ebx once and
+        calls through it)."""
+        if getattr(self, "_reg_imports", None) is None:
+            writes, loads = {}, {}
+            for a, b in self.blocks:
+                for i in decode_block(a, b):
+                    _, w = i.regs_access()
+                    if i.mnemonic == "pop":
+                        continue  # the epilogue restoring the caller's value
+                    for r in w:
+                        n = i.reg_name(r)
+                        n = REG16.get(n) or REG8L.get(n) or REG8H.get(n) or n  # bx, bl, bp... count as ebx/ebp
+                        writes[n] = writes.get(n, 0) + 1
+                    ops = i.operands
+                    if i.mnemonic == "mov" and len(ops) == 2 and ops[0].type == x86.X86_OP_REG and \
+                            ops[1].type == x86.X86_OP_MEM and not ops[1].mem.base and not ops[1].mem.index and \
+                            (ops[1].mem.disp & 0xFFFFFFFF) in iat:
+                        slot = ops[1].mem.disp & 0xFFFFFFFF
+                        loads.setdefault(i.reg_name(ops[0].reg), set()).add(slot)
+            # exact: the only value the register ever holds; maybe: one import
+            # slot loaded into it somewhere (calls through it check at run time)
+            exact = {r: iat[next(iter(s))] for r, s in loads.items()
+                     if len(s) == 1 and r in ("ebx", "esi", "edi", "ebp") and writes.get(r) == 1}
+            maybe = {r: (iat[next(iter(s))], next(iter(s))) for r, s in loads.items() if len(s) == 1}
+            self._reg_imports = (exact, maybe)
+        return self._reg_imports
+
     def is_term(self, i):
         g = set(i.groups)
         return i.mnemonic in ("call", "loop", "jecxz") or x86.X86_GRP_JUMP in g or x86.X86_GRP_RET in g
@@ -1306,13 +1366,28 @@ class Lifter:
                         "else { rt_setjmp3(c); %s } }" % (nxt, SPILL, RELOAD, RELOAD)]
             if direct:
                 return [self.call_direct(op.imm & 0xFFFFFFFF, nxt)]
+            imp, guard = "", None
+            if op.type == x86.X86_OP_MEM and not op.mem.base and not op.mem.index:
+                imp = iat.get(op.mem.disp & 0xFFFFFFFF, "")
+            elif op.type == x86.X86_OP_REG:
+                exact, maybe = self.reg_imports()
+                r = i.reg_name(op.reg)
+                if r in exact:
+                    imp = exact[r]
+                elif r in maybe and maybe[r][0] in INLINE_IMPORTS:
+                    imp, guard = maybe[r]  # the register holds it on some paths: check at run time
+            if imp in INLINE_IMPORTS and guard is None:
+                return [INLINE_IMPORTS[imp]]
             t = self.get(i, op, 4)
             # per-site cache of the last target's table entry (entries are
             # immutable, so one pointer is a consistent (addr, fn) pair)
-            return ["{ uint32_t t_ = %s; esp -= 4; M32(esp) = 0x%Xu; %s { static const FnEntry *ic_; "
+            call = ("{ uint32_t t_ = %s; esp -= 4; M32(esp) = 0x%Xu; %s { static const FnEntry *ic_; "
                     "const FnEntry *e_ = __atomic_load_n(&ic_, __ATOMIC_RELAXED); "
                     "if (e_ && e_->addr == t_) e_->fn(c); else rt_call_ic(c, t_, &ic_); } %s }" % (
-                t, nxt, SPILL, RELOAD)]
+                        t, nxt, SPILL, RELOAD))
+            if guard is not None:
+                return ["if (%s == M32(0x%Xu)) %s else %s" % (t, guard, INLINE_IMPORTS[imp], call)]
+            return [call]
         if x86.X86_GRP_RET in i.groups:
             n = op.imm if op else 0
             return ["esp += %d; %s return;" % (4 + n, SPILL)]

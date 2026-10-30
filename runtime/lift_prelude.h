@@ -6,6 +6,7 @@
 void rt_call_ic(CPU *c, uint32_t t, const FnEntry **cache);
 jmp_buf *rt_setjmp_slot(CPU *c, uint32_t guest_jb);
 void rt_setjmp3(CPU *c);
+void rt_spin_release(uint32_t lock);  /* inlined InterlockedCompareExchange (runtime/kernel32.c) */
 #define SPILL() do { c->r[0] = eax; c->r[1] = ecx; c->r[2] = edx; c->r[3] = ebx; \
     c->r[4] = esp; c->r[5] = ebp; c->r[6] = esi; c->r[7] = edi; } while (0)
 #define RELOAD() do { eax = c->r[0]; ecx = c->r[1]; edx = c->r[2]; ebx = c->r[3]; \

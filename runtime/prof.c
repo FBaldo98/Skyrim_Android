@@ -213,8 +213,9 @@ void cpu_report(void) {
     if (last_t != 0) {
         LOG("cpu: %.0f%% of one core in total;%s", total, out);
         clock_report();
-        extern void spin_report(void);
+        extern void spin_report(void), import_report(unsigned);
         spin_report();
+        import_report(30);
     }
     last_t = now;
 }

@@ -522,6 +522,16 @@ static int g_park_on = -1;
 static int g_park_n[PARK_BUCKETS];  /* waiters parked, by lock address hash */
 static int *park_bucket(uint32_t a) { return &g_park_n[(a * 2654435761u) >> 24]; }
 
+/* InterlockedCompareExchange(lock, 0, owner) succeeded: a spin lock release.
+ * Wake one waiter parked on it. Also called from InterlockedCompareExchange
+ * inlined by the lifter (INLINE_IMPORTS in tools/lift.py). */
+void rt_spin_release(uint32_t a) {
+    if (__atomic_load_n(park_bucket(a), __ATOMIC_SEQ_CST)) {
+        syscall(SYS_futex, MEM + a, FUTEX_WAKE_PRIVATE, 1, NULL, NULL, 0);
+        __atomic_fetch_add(&g_park_wakes, 1, __ATOMIC_RELAXED);
+    }
+}
+
 static int spinlock_park(CPU *c) {
     if (g_park_on < 0) {
         char path[1100];
@@ -1937,11 +1947,7 @@ SHIM(InterlockedCompareExchange) {
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
     int ok = __atomic_compare_exchange_n((uint32_t *)(MEM + ARG(0)), &exp, ARG(1), 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
-    /* a spin lock release: wake one waiter parked on it (see spinlock_park) */
-    if (ok && ARG(1) == 0 && exp && __atomic_load_n(park_bucket(ARG(0)), __ATOMIC_SEQ_CST)) {
-        syscall(SYS_futex, MEM + ARG(0), FUTEX_WAKE_PRIVATE, 1, NULL, NULL, 0);
-        __atomic_fetch_add(&g_park_wakes, 1, __ATOMIC_RELAXED);
-    }
+    if (ok && ARG(1) == 0 && exp) rt_spin_release(ARG(0));
     RET(exp, 3);
 }
 SHIM(lstrcmpiA) { RET((uint32_t)strcasecmp(GSTR(ARG(0)) ? GSTR(ARG(0)) : "", GSTR(ARG(1)) ? GSTR(ARG(1)) : ""), 2); }

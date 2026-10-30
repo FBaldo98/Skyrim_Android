@@ -11,6 +11,25 @@ unsigned rt_module_count(unsigned m);
 #define MAX_THUNKS 8192
 static struct { ShimFn fn; const char *name; } g_thunks[MAX_THUNKS];
 static uint32_t g_nthunks;
+static uint32_t g_thunk_calls[MAX_THUNKS];  /* calls per import since the last report (racy, approximate) */
+
+/* The most called imports per second since the last call; printed with the
+ * watchdog's cpu report every 30 s (secs = the report interval). */
+void import_report(unsigned secs) {
+    uint32_t n = __atomic_load_n(&g_nthunks, __ATOMIC_ACQUIRE), total = 0;
+    char out[1024] = "";
+    static uint32_t snap[MAX_THUNKS];
+    for (uint32_t i = 0; i < n; i++) { snap[i] = g_thunk_calls[i]; g_thunk_calls[i] = 0; total += snap[i]; }
+    for (int top = 0; top < 12; top++) {
+        uint32_t best = 0, bi = 0;
+        for (uint32_t i = 0; i < n; i++) if (snap[i] > best) { best = snap[i]; bi = i; }
+        if (!best) break;
+        size_t l = strlen(out);
+        snprintf(out + l, sizeof out - l, " %s:%u", g_thunks[bi].name, best / secs);
+        snap[bi] = 0;
+    }
+    LOG("imports per s: %u total;%s", total / secs, out);
+}
 static pthread_mutex_t g_thunk_lock = PTHREAD_MUTEX_INITIALIZER;
 
 uint32_t rt_thunk(ShimFn fn, const char *name) {
@@ -167,6 +186,7 @@ void rt_call(CPU *c, uint32_t t) {
     if (t >= GUEST_THUNK_BASE) {
         uint32_t i = (t - GUEST_THUNK_BASE) / 4;
         if (i < __atomic_load_n(&g_nthunks, __ATOMIC_ACQUIRE)) {
+            g_thunk_calls[i]++;
             wd_note(c, g_thunks[i].name);
             TRACE("-> %s", g_thunks[i].name);
             if (!g_thunks[i].fn)
