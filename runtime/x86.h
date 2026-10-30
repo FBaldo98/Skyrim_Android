@@ -146,6 +146,19 @@ static inline uint32_t shrd32(uint32_t a, uint32_t b, uint32_t n, Flags *f) {
 
 /* ---- x87 ---- */
 #define ST(i) (c->st[(c->top + (i)) & 7])
+/* fld m32: float -> double the compiler cannot fold with a later fstp m32.
+ * x87 quiets a signalling NaN on load, and MSVC copies 4-byte fields (not
+ * always floats) with fld/fstp; with the stack in locals LLVM would turn
+ * the pair into a raw copy that keeps the signalling bit. */
+static inline double fext32(float f) {
+    double d = (double)f;
+#if defined(__aarch64__)
+    __asm__("" : "+w"(d));
+#elif defined(__x86_64__)
+    __asm__("" : "+x"(d));
+#endif
+    return d;
+}
 static inline void fpush(CPU *c, double v) { c->top = (c->top - 1) & 7; c->st[c->top] = v; }
 static inline void fpop(CPU *c) { c->top = (c->top + 1) & 7; }
 static inline void fcompare(CPU *c, double a, double b) {

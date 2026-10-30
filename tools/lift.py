@@ -9,6 +9,7 @@ so a missing feature fails loudly at runtime instead of silently.
 """
 import json
 import os
+import re
 import sys
 
 import capstone
@@ -81,6 +82,112 @@ MEMORDER = os.environ.get("LIFT_MEMORDER") == "1"
 # lift_prelude.h), so guest threads can run on several cores. On by default;
 # LIFT_TSO=0 emits plain accesses.
 TSO = os.environ.get("LIFT_TSO", "1") == "1"
+# x87 stack in C locals: within a run of code between control transfers the
+# lifter knows the stack depth statically, so ST(i) becomes a local double the
+# compiler keeps in a register instead of c->st[(c->top + i) & 7] in memory.
+# The stack is written back to c->st/c->top before every call, jump, return,
+# block end and any instruction that needs the real FPU state. LIFT_X87REG=0
+# emits the plain c->st form.
+X87REG = os.environ.get("LIFT_X87REG", "1") == "1"
+X87_BARRIER = ("fxam(", "fprem(", "fpu_env(", "fstatus(", "c->top", "c->st")
+
+
+def is_x87(i):
+    """Escape opcodes D8-DF after any prefixes (decoded by Lifter.lift_x87)."""
+    b = i.bytes
+    k = 0
+    while k < len(b) and b[k] in (0x9B, 0x66, 0xF2, 0xF3, 0x2E, 0x3E, 0x26, 0x36, 0x64, 0x65):
+        k += 1
+    return k < len(b) and 0xD8 <= b[k] <= 0xDF
+
+
+class X87Model:
+    """Stack slots relative to c->top at the last flush: a push moves `cur` down
+    one, ST(i) is slot cur + i. `cache` maps slot -> [dirty, live]; popped slots
+    stay as dead entries so a flush still stores their value, as the register
+    file would hold it (live stores go last, so they win over a dead alias)."""
+
+    def __init__(self):
+        self.names = set()
+        self.reset()
+
+    def reset(self):
+        self.cur = 0
+        self.cache = {}
+
+    def var(self, s):
+        n = "x87_%s%d" % ("m" if s < 0 else "p", abs(s))
+        self.names.add(n)
+        return n
+
+    def flush(self):
+        out = []
+        order = sorted(self.cache.items(), key=lambda kv: kv[1][1])  # dead first
+        for s, (dirty, live) in order:
+            if dirty:
+                out.append("c->st[(c->top + %du) & 7] = %s;" % (s & 7, self.var(s)))
+        if self.cur & 7:
+            out.append("c->top = (c->top + %du) & 7;" % (self.cur & 7))
+        self.reset()
+        return out
+
+    def _span_ok(self, text):
+        """Would this instruction's slots stay within 8 consecutive ones (no
+        two of them the same register)? Otherwise flush first."""
+        ks = [int(m) for m in re.findall(r"ST\((\d)\)", text)] or [0]
+        pushes = text.count("fpush(c,")
+        slots = set(self.cache) | {self.cur - pushes, self.cur + max(ks)}
+        return max(slots) - min(slots) < 8
+
+    def _st(self, s, pre):
+        if s not in self.cache:
+            pre.append("%s = c->st[(c->top + %du) & 7];" % (self.var(s), s & 7))
+            self.cache[s] = [False, True]
+        return self.var(s)
+
+    def _rewrite(self, t, pre, write_target=None):
+        out = []
+        p = 0
+        while p < len(t):
+            if t.startswith("fpush(c, ", p):
+                q, depth = p + 9, 1
+                while depth:
+                    depth += {"(": 1, ")": -1}.get(t[q], 0)
+                    q += 1
+                expr = self._rewrite(t[p + 9:q - 1], pre)
+                self.cur -= 1
+                self.cache[self.cur] = [True, True]
+                out.append("%s = %s" % (self.var(self.cur), expr))
+                p = q
+            elif t.startswith("fpop(c)", p):
+                if self.cur in self.cache:
+                    self.cache[self.cur][1] = False
+                self.cur += 1
+                out.append("(void)0")
+                p += 7
+            elif t.startswith("ST(", p):
+                s = self.cur + int(t[p + 3])
+                name = self._st(s, pre)
+                # an assignment to ST(k) makes the slot dirty
+                rest = t[p + 5:].lstrip()
+                if rest.startswith("=") and not rest.startswith("=="):
+                    self.cache[s][0] = True
+                out.append(name)
+                p += 5
+            else:
+                out.append(t[p])
+                p += 1
+        return "".join(out)
+
+    def lift(self, lines):
+        """Rewrites one x87 instruction's lines; returns the new lines."""
+        text = " ".join(lines)
+        if any(b in text for b in X87_BARRIER):
+            return self.flush() + lines
+        out = [] if self._span_ok(text) else self.flush()
+        pre = []
+        body = self._rewrite(text, pre)
+        return out + pre + [body]
 
 
 def stack_op(i, op, frame):
@@ -617,7 +724,7 @@ class Lifter:
                     e("fcompare(c, ST(0), %s); fpop(c);" % src)
             elif op == 0xD9:
                 if reg == 0:
-                    e("fpush(c, (double)MF32(%s));" % a)
+                    e("fpush(c, fext32(MF32(%s)));" % a)
                 elif reg == 2:
                     e("MF32(%s) = (float)ST(0);" % a)
                 elif reg == 3:
@@ -1129,7 +1236,11 @@ class Lifter:
         head = img[self.f - BASE:self.f - BASE + 5]
         frame = head[:3] == b"\x55\x8b\xec" or head == b"\x8b\xff\x55\x8b\xec"  # optional hot-patch mov edi, edi
         self.frame = frame
+        decl_at = len(o)
+        x87 = X87Model() if X87REG else None
         for bi, (a, b) in enumerate(order):
+            if x87:
+                x87.reset()  # every way in has flushed
             o.append("L_%X:" % a)
             insns = decode_block(a, b)
             if not insns or insns[-1].address + insns[-1].size != b:
@@ -1146,13 +1257,23 @@ class Lifter:
                     if ld_pending and i.mnemonic != "call" and i.mnemonic != "jmp":
                         lines = ["LD_FENCE();"] + lines
                         ld_pending = False
+                    if x87:
+                        lines = x87.flush() + lines
                 else:
                     lines = self.lift(i)
+                    if x87:
+                        if is_x87(i):
+                            lines = x87.lift(lines)
+                        elif any(b in line for line in lines for b in ("c->top", "c->st")):
+                            lines = x87.flush() + lines
                     if shared_load(i, frame):
                         ld_pending = True
                     lines = mem_order(i, lines, frame)
                 for line in lines:
                     o.append("    " + line)
+                if last and not self.is_term(i) and x87:
+                    for line in x87.flush():
+                        o.append("    " + line)
                 if last and not self.is_term(i):
                     # fall through into the next block
                     if bi + 1 < len(order) and order[bi + 1][0] == nxt:
@@ -1164,6 +1285,8 @@ class Lifter:
             o.append("L_dispatch:")
             o.append("    switch (jt_) { %s default: %s rt_call(c, jt_); return; }" % (cases, SPILL))
         o.append("}")
+        if x87 and x87.names:
+            o.insert(decl_at, "    double %s;" % ", ".join(sorted(x87.names)))
         return o
 
     def is_term(self, i):
