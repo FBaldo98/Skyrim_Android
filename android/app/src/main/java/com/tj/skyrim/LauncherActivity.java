@@ -104,6 +104,10 @@ public class LauncherActivity extends Activity {
     private static final String[] BLUR = {"Low", "Medium", "High"};
     private static final String[] FADE = {"Short", "Medium", "Far", "Very far"};
     private static final String[] FADE_V = {"2.5", "4.5", "6.5", "9.0"};
+    // Frame rate limit (<save>/fps.cfg; 0 = vsync only). 30 keeps a phone
+    // from heating up into its throttled clocks.
+    private static final String[] FPS = {"30 fps", "45 fps", "60 fps", "Off"};
+    private static final int[] FPS_V = {30, 45, 60, 0};
 
     @Override
     protected void onCreate(Bundle b) {
@@ -219,6 +223,7 @@ public class LauncherActivity extends Activity {
         spinner(root, "decals", "Decal quantity", DECALS, 2);
         spinner(root, "blur", "Radial blur quality", BLUR, 2);
         spinner(root, "fade", "Object fade distance", FADE, 2);
+        spinner(root, "fps", "Frame rate limit", FPS, 0);
         check(root, "fxaa", "FXAA", false);
         check(root, "vsync", "Vertical sync", true);
         check(root, "touch", "Touch controls", true);
@@ -433,6 +438,9 @@ public class LauncherActivity extends Activity {
             }
             try (Writer w = new OutputStreamWriter(new FileOutputStream(new File(save, "touch.cfg")))) {
                 w.write((checks.get("touch").isChecked() ? "1" : "0") + " " + (checks.get("nintendo").isChecked() ? "1" : "0") + "\n");
+            }
+            try (Writer w = new OutputStreamWriter(new FileOutputStream(new File(save, "fps.cfg")))) {
+                w.write(FPS_V[sel("fps")] + "\n");
             }
         } catch (Exception ex) {
             folderStatus.setText("Could not write the settings: " + ex);

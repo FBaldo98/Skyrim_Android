@@ -13,13 +13,13 @@ android {
         applicationId dual ? "com.tj.skyrim.dual" : "com.tj.skyrim"
         resValue "string", "app_name", dual ? "Skyrim Dual" : "Skyrim"
         buildConfigField "boolean", "DUAL", dual ? "true" : "false"
-        minSdkVersion 28
+        minSdkVersion 29  // Android 10: native ELF TLS (API 28 falls back to slow emutls)
         targetSdkVersion 29  // legacy storage: plain file access with the normal storage prompt
         versionCode 23
         versionName dual ? "0.21-dual" : "0.21"
         externalNativeBuild {
             cmake {
-                arguments "-DANDROID_STL=c++_shared", "-DANDROID_PLATFORM=android-28", "-DLB_GEN_JOBS=6"
+                arguments "-DANDROID_STL=c++_shared", "-DANDROID_PLATFORM=android-29", "-DLB_GEN_JOBS=6"
                 abiFilters 'arm64-v8a'
             }
         }

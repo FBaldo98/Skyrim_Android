@@ -102,6 +102,53 @@ void prof_report(void) {
     free(bins);
 }
 
+static long read_long(const char *path) {
+    FILE *f = fopen(path, "r");
+    long v = -1;
+    if (f) { if (fscanf(f, "%ld", &v) != 1) v = -1; fclose(f); }
+    return v;
+}
+
+/* Current clock and its cap per cpufreq policy, plus the thermal status: a
+ * hot phone caps every core far below its maximum, which swamps any fps
+ * comparison between runs. */
+static void clock_report(void) {
+    char out[512] = "";
+    for (int cpu = 0; cpu < 16; cpu++) {
+        char path[96];
+        snprintf(path, sizeof path, "/sys/devices/system/cpu/cpufreq/policy%d/scaling_cur_freq", cpu);
+        long cur = read_long(path);
+        if (cur < 0) continue;
+        snprintf(path, sizeof path, "/sys/devices/system/cpu/cpufreq/policy%d/scaling_max_freq", cpu);
+        long cap = read_long(path);
+        snprintf(path, sizeof path, "/sys/devices/system/cpu/cpufreq/policy%d/cpuinfo_max_freq", cpu);
+        long max = read_long(path);
+        size_t l = strlen(out);
+        snprintf(out + l, sizeof out - l, " cpu%d+ %ld/%ld/%ld", cpu, cur / 1000, cap / 1000, max / 1000);
+    }
+    int thermal = -1;
+#ifdef __ANDROID__
+    /* AThermal is API 30; minSdk is 29 */
+    typedef void *(*Acquire)(void);
+    typedef int (*Status)(void *);
+    static Acquire acq;
+    static Status st;
+    static void *mgr;
+    static int tried;
+    if (!tried) {
+        tried = 1;
+        void *lib = dlopen("libandroid.so", RTLD_NOW);
+        if (lib) {
+            acq = (Acquire)dlsym(lib, "AThermal_acquireManager");
+            st = (Status)dlsym(lib, "AThermal_getCurrentThermalStatus");
+            if (acq && st) mgr = acq();
+        }
+    }
+    if (mgr) thermal = st(mgr);
+#endif
+    LOG("clocks MHz (cur/cap/max):%s; thermal status %d", out, thermal);
+}
+
 /* Per-thread CPU use since the last call, from /proc/self/task: the SIGPROF
  * sampler above is limited by the kernel tick, so its sample count is not a
  * measure of how busy the cores are. */
@@ -163,6 +210,11 @@ void cpu_report(void) {
         n++;
     }
     closedir(d);
-    if (last_t != 0) LOG("cpu: %.0f%% of one core in total;%s", total, out);
+    if (last_t != 0) {
+        LOG("cpu: %.0f%% of one core in total;%s", total, out);
+        clock_report();
+        extern void spin_report(void);
+        spin_report();
+    }
     last_t = now;
 }

@@ -7,8 +7,10 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <fnmatch.h>
+#include <linux/futex.h>
 #include <sched.h>
 #include <string.h>
+#include <sys/syscall.h>
 #include <strings.h>
 #include <sys/stat.h>
 #include <sys/time.h>
@@ -267,6 +269,26 @@ static void pin_guest_thread(void) {
             CPU_ZERO(&g_fast);
             for (int i = 0; i < ncpu; i++)
                 if (khz[i] > 0 && khz[i] >= cut) { CPU_SET(i, &g_fast); nfast++; }
+            /* one core design throughout (Snapdragon 8 Elite: Oryon at two
+             * clocks) has no little cores to avoid: the lower-clocked ones are
+             * still big, and leaving them idle packs the game onto two cores */
+            unsigned part = 0;
+            int nparts = 0, uniform = 1;
+            FILE *ci = fopen("/proc/cpuinfo", "r");
+            if (ci) {
+                char l[256];
+                unsigned p;
+                while (fgets(l, sizeof l, ci))
+                    if (sscanf(l, "CPU part : %x", &p) == 1) {
+                        if (nparts++ && p != part) uniform = 0;
+                        part = p;
+                    }
+                fclose(ci);
+            }
+            if (nparts >= 2 && uniform && nfast < ncpu) {
+                LOG("all %d cores are one design (part %#x)", ncpu, part);
+                nfast = ncpu;
+            }
             if (access(path, F_OK) == 0 || best <= 0 || nfast < 2 || nfast >= ncpu)
                 LOG("guest threads on all cores (%d fast of %d; save/singlecore.txt pins them to one)", nfast, ncpu);
             else {
@@ -454,8 +476,77 @@ SHIM(GetProcessAffinityMask) {
     RET(1, 3);
 }
 SHIM(SetThreadExecutionState) { RET(0x80000000u, 1); }
+/* Who spins: calls to Sleep(0) / Sleep(n) / zero-timeout waits, by the guest
+ * return address; printed with the watchdog's cpu report every 30 s. */
+enum { SPIN_SLOTS = 64 };
+static unsigned g_parks, g_park_wakes;  /* spin lock waiters parked / woken (spinlock_park) */
+static struct { uint32_t ret, kind; uint32_t n; } g_spin[SPIN_SLOTS];
+static void spin_count(uint32_t ret, uint32_t kind) {
+    uint32_t h = (ret * 2654435761u + kind) % SPIN_SLOTS;
+    for (int p = 0; p < SPIN_SLOTS; p++, h = (h + 1) % SPIN_SLOTS) {
+        if (!g_spin[h].ret) { g_spin[h].ret = ret; g_spin[h].kind = kind; }
+        if (g_spin[h].ret == ret && g_spin[h].kind == kind) { __atomic_fetch_add(&g_spin[h].n, 1, __ATOMIC_RELAXED); return; }
+    }
+}
+void spin_report(void) {
+    static const char *k_kind[] = {"Sleep(0)", "Sleep(n)", "Wait(0)"};
+    char out[1024] = "";
+    uint32_t total[3] = {0};
+    for (int top = 0; top < 8; top++) {
+        int best = -1;
+        for (int i = 0; i < SPIN_SLOTS; i++)
+            if (g_spin[i].n && (best < 0 || g_spin[i].n > g_spin[best].n)) best = i;
+        if (best < 0) break;
+        uint32_t n = __atomic_exchange_n(&g_spin[best].n, 0, __ATOMIC_RELAXED);
+        total[g_spin[best].kind] += n;
+        size_t l = strlen(out);
+        snprintf(out + l, sizeof out - l, " %s@%08x:%u", k_kind[g_spin[best].kind], g_spin[best].ret, n / 30);
+    }
+    for (int i = 0; i < SPIN_SLOTS; i++) total[g_spin[i].kind] += __atomic_exchange_n(&g_spin[i].n, 0, __ATOMIC_RELAXED);
+    LOG("spin per s: Sleep(0) %u, Sleep(n) %u, Wait(0) %u, parked %u, woken %u; top:%s", total[0] / 30, total[1] / 30,
+        total[2] / 30, __atomic_exchange_n(&g_parks, 0, __ATOMIC_RELAXED) / 30,
+        __atomic_exchange_n(&g_park_wakes, 0, __ATOMIC_RELAXED) / 30, out);
+}
+
+/* Skyrim's BSSpinLock::Lock (0x401710) retries a CAS of the owner's thread id
+ * into [esi] with Sleep(0) between tries (Sleep(1) after 10000), with no pause:
+ * a waiter burns a whole core for as long as the holder keeps the lock, about
+ * 20k Sleep(0)s a second in the open world. After a short spin (ebx counts the
+ * tries) the waiter instead sleeps on a futex on the lock word until the release,
+ * InterlockedCompareExchange(lock, 0, owner), wakes it. A release that does not
+ * come through that shim is caught by the timeout. save/nopark.txt turns it off. */
+#define PARK_AFTER_TRIES 32
+#define PARK_TIMEOUT_NS 200000
+#define PARK_BUCKETS 256
+static int g_park_on = -1;
+static int g_park_n[PARK_BUCKETS];  /* waiters parked, by lock address hash */
+static int *park_bucket(uint32_t a) { return &g_park_n[(a * 2654435761u) >> 24]; }
+
+static int spinlock_park(CPU *c) {
+    if (g_park_on < 0) {
+        char path[1100];
+        snprintf(path, sizeof path, "%s/nopark.txt", g_save_dir);
+        g_park_on = access(path, F_OK) != 0;
+        LOG(g_park_on ? "spin lock waiters park (save/nopark.txt turns it off)" : "spin lock parking off");
+    }
+    uint32_t a = c->r[6];
+    if (!g_park_on || c->r[3] < PARK_AFTER_TRIES || (a & 3)) return 0;
+    uint32_t *p = (uint32_t *)(MEM + a);
+    uint32_t owner = __atomic_load_n(p, __ATOMIC_SEQ_CST);
+    if (!owner) return 1;  /* just released: retry the CAS at once */
+    int *b = park_bucket(a);
+    __atomic_fetch_add(b, 1, __ATOMIC_SEQ_CST);
+    struct timespec to = {0, PARK_TIMEOUT_NS};
+    syscall(SYS_futex, p, FUTEX_WAIT_PRIVATE, owner, &to, NULL, 0);
+    __atomic_fetch_sub(b, 1, __ATOMIC_SEQ_CST);
+    __atomic_fetch_add(&g_parks, 1, __ATOMIC_RELAXED);
+    return 1;
+}
+
 SHIM(Sleep) {
     uint32_t ms = ARG(0);
+    spin_count(M32(c->r[4]), ms != 0);
+    if (M32(c->r[4]) == 0x401755 && spinlock_park(c)) RET(0, 1);
     if (ms == 0) sched_yield();
     else usleep(ms * 1000);
     RET(0, 1);
@@ -611,6 +702,7 @@ SHIM(ReleaseSemaphore) {
 }
 SHIM(WaitForSingleObject) {
     uint32_t h = ARG(0);
+    if (ARG(1) == 0) spin_count(M32(c->r[4]), 2);
     RET(wait_objects(1, &h, 0, ARG(1)), 2);
 }
 SHIM(WaitForMultipleObjects) {
@@ -908,6 +1000,7 @@ SHIM(SleepEx) {
     uint32_t ms = ARG(0), alertable = ARG(1);
     if (alertable && run_apcs(c)) RET(0xC0, 2);  /* WAIT_IO_COMPLETION */
     if (ms == 0xFFFFFFFFu) ms = 1;  /* nothing else can queue an APC for us */
+    spin_count(M32(c->r[4]), ms != 0);
     if (ms == 0) sched_yield(); else usleep(ms * 1000u);
     RET(0, 2);
 }
@@ -1842,8 +1935,13 @@ SHIM(LocalFree) { if (ARG(0)) gfree(ARG(0)); RET(0, 1); }
 SHIM(InterlockedCompareExchange) {
     uint32_t exp = ARG(2);
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
-    __atomic_compare_exchange_n((uint32_t *)(MEM + ARG(0)), &exp, ARG(1), 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    int ok = __atomic_compare_exchange_n((uint32_t *)(MEM + ARG(0)), &exp, ARG(1), 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    /* a spin lock release: wake one waiter parked on it (see spinlock_park) */
+    if (ok && ARG(1) == 0 && exp && __atomic_load_n(park_bucket(ARG(0)), __ATOMIC_SEQ_CST)) {
+        syscall(SYS_futex, MEM + ARG(0), FUTEX_WAKE_PRIVATE, 1, NULL, NULL, 0);
+        __atomic_fetch_add(&g_park_wakes, 1, __ATOMIC_RELAXED);
+    }
     RET(exp, 3);
 }
 SHIM(lstrcmpiA) { RET((uint32_t)strcasecmp(GSTR(ARG(0)) ? GSTR(ARG(0)) : "", GSTR(ARG(1)) ? GSTR(ARG(1)) : ""), 2); }

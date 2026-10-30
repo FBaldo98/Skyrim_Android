@@ -63,13 +63,13 @@ android {
     ndkVersion project.hasProperty('ndkVersion') ? project.property('ndkVersion') : null
     defaultConfig {
         applicationId "%(pkg)s"
-        minSdkVersion 28
+        minSdkVersion 29
         targetSdkVersion 34
         versionCode 1
         versionName "0.1"
         externalNativeBuild {
             cmake {
-                arguments "-DANDROID_STL=c++_shared", "-DANDROID_PLATFORM=android-28"
+                arguments "-DANDROID_STL=c++_shared", "-DANDROID_PLATFORM=android-29"
                 abiFilters 'arm64-v8a'
             }
         }

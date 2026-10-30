@@ -3,6 +3,8 @@
 #include "game.h"
 #include "rt.h"
 #include <SDL2/SDL.h>
+#include <errno.h>
+#include <time.h>
 #ifndef __ANDROID__
 #include <fcntl.h>
 #endif
@@ -244,7 +246,40 @@ static void poll_key_fifo(void) {
 #endif
 }
 
+/* Frame rate limit from the launcher (<save>/fps.cfg, "30"; 0 or missing =
+ * vsync only). A phone that renders faster than it can stay cool throttles
+ * to half its clocks within a minute or two; capping evens that out. The
+ * render thread sleeps to an absolute deadline: no busy-wait (dxvk's own
+ * limiter spins the last few ms of every frame, which costs the power the
+ * cap is meant to save). */
+static void frame_limit(void) {
+    static int64_t interval = -1, next;
+    if (interval < 0) {
+        char path[1100];
+        int fps = 0;
+        snprintf(path, sizeof path, "%s/fps.cfg", g_save_dir);
+        FILE *f = fopen(path, "r");
+        if (f) { if (fscanf(f, "%d", &fps) != 1) fps = 0; fclose(f); }
+        interval = fps > 0 ? 1000000000LL / fps : 0;
+        LOG(fps > 0 ? "frame rate limit %d fps" : "no frame rate limit", fps);
+    }
+    if (!interval) return;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    int64_t now = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+    if (now < next) {
+        ts.tv_sec = (time_t)(next / 1000000000LL);
+        ts.tv_nsec = (long)(next % 1000000000LL);
+        while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL) == EINTR) {}
+        next += interval;
+    } else {
+        /* a late frame keeps the cadence; one more than a frame late starts over */
+        next = now - next > interval ? now + interval : next + interval;
+    }
+}
+
 void platform_present_hook(void) {
+    frame_limit();
     SDL_Event e;
     poll_key_fifo();
     while (SDL_PollEvent(&e)) {

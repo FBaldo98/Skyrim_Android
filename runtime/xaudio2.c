@@ -7,10 +7,14 @@
  * them and calls into XAudio2 from its own threads while holding its locks.
  * A pass is: OnProcessingPassStart / OnVoiceProcessingPassStart (unlocked),
  * mix (locked, buffer events recorded), then the recorded events (unlocked). */
+#define _GNU_SOURCE  /* sched_getcpu */
 #include "hcom.h"
 #include <SDL2/SDL.h>
+#include <errno.h>
 #include <math.h>
 #include <pthread.h>
+#include <sched.h>
+#include <sys/resource.h>
 #include <time.h>
 #include <unistd.h>
 #include <libavcodec/avcodec.h>
@@ -500,6 +504,9 @@ static void *engine_main(void *arg) {
     (void)arg;
     CPU *c = rt_new_cpu();
     rt_thread_init(c);
+    /* ANDROID_PRIORITY_AUDIO: with guest threads on every core the mixer
+     * otherwise waits behind them for longer than the device queue lasts */
+    if (setpriority(PRIO_PROCESS, 0, -16)) LOG("xaudio2: setpriority failed: %d", errno);
     int frames = g_rate * PASS_FRAMES_MS / 1000;
     float *out = malloc(sizeof(float) * 2 * (size_t)frames);
     uint64_t next = now_us();
@@ -532,10 +539,15 @@ static void *engine_main(void *arg) {
         if (g_dev) {
             /* the device drained before this pass was ready: an audible gap */
             static unsigned s_under;
+            static uint64_t s_last_q;
+            uint64_t tq = now_us();
             if (!SDL_GetQueuedAudioSize(g_dev) && (++s_under <= 20 || s_under % 200 == 0))
-                LOG("xaudio2: underrun %u (pass took %u us)", s_under, (unsigned)(now_us() - tp));
+                LOG("xaudio2: underrun %u (pass took %u us, %u us since the last queue, cpu %d)", s_under,
+                    (unsigned)(tq - tp), s_last_q ? (unsigned)(tq - s_last_q) : 0, sched_getcpu());
             SDL_QueueAudio(g_dev, out, (Uint32)(sizeof(float) * 2 * (size_t)frames));
-        }    }
+            s_last_q = tq;
+        }
+    }
     return NULL;
 }
 

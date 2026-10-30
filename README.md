@@ -129,7 +129,7 @@ Useful environment variables:
 
 ## 3. Installing
 
-Requirements: an arm64 Android phone with Android 9 or newer and Vulkan 1.1 (most Snapdragon 6xx/7xx/8xx devices from 2018 on), 3 GB of RAM or more, and about 7 GB of free space.
+Requirements: an arm64 Android phone with Android 10 or newer and Vulkan 1.1 (most Snapdragon 6xx/7xx/8xx devices from 2018 on), 3 GB of RAM or more, and about 7 GB of free space.
 
 1. **Install the APK.** Copy it to the phone and open it, allowing "Install unknown apps" for your file manager or browser, or use `adb install -r Skyrim-<version>.apk`. Newer versions install over older ones.
 2. **Copy the game files** listed above into one folder anywhere outside `Android/data`, for example `Internal storage/Skyrim/`. The `Data` folder goes inside it, next to the exe and DLLs.
@@ -151,10 +151,12 @@ Switches: create an empty file with one of these names in `port/save/`:
 |---|---|
 | `singlecore.txt` | Runs all of the game's threads on one core (slower, but rules out threading problems). |
 | `noprof.txt` | Turns off the sampling profiler in the log. |
+| `allcores.txt` | Runs the game's threads on every core (the default when all cores are one design, e.g. Snapdragon 8 Elite). |
+| `nopark.txt` | Waiters on the game's spin locks keep spinning instead of sleeping until the lock is released. |
 
 ## Known issues
-- Music and voices in xWMA format play silent.
 - Performance on an Adreno 610 is low; use the Low preset and a low resolution.
+- Phones throttle within a few minutes of play; the launcher's 30 fps frame rate limit (the default) keeps frame times even.
 
 ## Legal
 The Elder Scrolls, Skyrim, Bethesda and all related names and assets belong to their respective owners. This project is not affiliated with or endorsed by them. Do not redistribute anything produced from the game or game files. Third-party code keeps its own licenses: SDL2 (zlib) in `android/app/jni/SDL2`, dxvk-native (zlib) in `android/app/jni/dxvk`, FFmpeg (LGPL 2.1 or later) in `android/app/jni/ffmpeg` (wmav1/wmav2 decoders only).
